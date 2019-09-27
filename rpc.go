@@ -26,7 +26,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gorilla/websocket"
+	"nhooyr.io/websocket"
+	"nhooyr.io/websocket/wsjson"
 )
 
 const writeWait = 10 * time.Second // allowed duration before timing out a write
@@ -70,7 +71,6 @@ type Client struct {
 	atomicSeq  uint32
 	addr       string
 	ws         *websocket.Conn
-	pongWait   time.Duration
 	pingPeriod time.Duration
 	notify     Notifier
 	calls      map[uint32]*call
@@ -153,35 +153,34 @@ func Dial(ctx context.Context, addr string, opts ...Option) (*Client, error) {
 	for _, f := range opts {
 		f(&o)
 	}
-	dialer := websocket.Dialer{
-		NetDialContext:    o.dial,
-		TLSClientConfig:   o.tls,
-		EnableCompression: true,
+	transport := http.Transport{
+		DialContext:        o.dial,
+		TLSClientConfig:    o.tls,
+		DisableCompression: false,
 	}
-	ws, _, err := dialer.DialContext(ctx, addr, o.header)
+	httpClient := http.Client{Transport: &transport}
+	dialOptions := websocket.DialOptions{
+		HTTPClient: &httpClient,
+		HTTPHeader: o.header,
+	}
+	ws, _, err := websocket.Dial(ctx, addr, &dialOptions)
 	if err != nil {
 		return nil, err
 	}
 	c := &Client{
 		addr:       addr,
 		ws:         ws,
-		pongWait:   o.pongWait,
 		pingPeriod: o.pingPeriod,
 		notify:     o.notify,
 		calls:      make(map[uint32]*call),
 		errc:       make(chan struct{}),
 	}
 	if o.pingPeriod != 0 {
-		ws.SetPongHandler(func(string) error {
-			ws.SetReadDeadline(time.Now().Add(c.pongWait))
-			return nil
-		})
 		// Initial read deadline must be set for the first ping message
 		// sent pingPeriod from now.
-		ws.SetReadDeadline(time.Now().Add(c.pingPeriod + c.pongWait))
-		go c.ping()
+		go c.ping(ctx)
 	}
-	go c.in()
+	go c.in(ctx)
 	return c, nil
 }
 
@@ -195,12 +194,8 @@ func (c *Client) String() string {
 func (c *Client) Close() error {
 	defer c.writing.Unlock()
 	c.writing.Lock()
-	msg := websocket.FormatCloseMessage(websocket.CloseNormalClosure, "")
-	writeErr := c.ws.WriteControl(websocket.CloseMessage, msg, time.Now().Add(writeWait))
-	closeErr := c.ws.Close()
-	if writeErr != nil {
-		return writeErr
-	}
+	closeErr := c.ws.Close(websocket.StatusNormalClosure, "")
+
 	return closeErr
 }
 
@@ -216,20 +211,25 @@ func (c *Client) setErr(err error) {
 	c.errMu.Unlock()
 }
 
-func (c *Client) ping() {
+func (c *Client) ping(ctx context.Context) {
 	ticker := time.NewTicker(c.pingPeriod)
 	defer func() {
 		ticker.Stop()
-		c.ws.Close()
+		c.ws.Close(websocket.StatusGoingAway, "")
 	}()
 	for {
 		select {
 		case <-c.Done():
 			return
+		case <-ctx.Done():
+			err := ctx.Err()
+			if err != nil {
+				c.setErr(err)
+			}
+			return
 		case <-ticker.C:
 			c.writing.Lock()
-			c.ws.SetWriteDeadline(time.Now().Add(writeWait))
-			err := c.ws.WriteMessage(websocket.PingMessage, nil)
+			err := c.ws.Ping(ctx)
 			c.writing.Unlock()
 			if err != nil {
 				c.setErr(err)
@@ -239,7 +239,7 @@ func (c *Client) ping() {
 	}
 }
 
-func (c *Client) in() {
+func (c *Client) in(ctx context.Context) {
 	// pair of channel vars retains notification processing order
 	block, unblockNext := make(chan struct{}), make(chan struct{})
 	close(block)
@@ -254,7 +254,7 @@ func (c *Client) in() {
 			Method string          `json:"method"`
 			Params json.RawMessage `json:"params"`
 		}
-		err := c.ws.ReadJSON(&resp)
+		err := wsjson.Read(ctx, c.ws, &resp)
 		if err != nil {
 			c.setErr(err)
 			return
@@ -265,6 +265,8 @@ func (c *Client) in() {
 			if c.notify != nil {
 				go func(block, unblockNext chan struct{}) {
 					select {
+					case <-ctx.Done():
+						return
 					case <-c.errc:
 						return
 					case <-block:
@@ -272,7 +274,7 @@ func (c *Client) in() {
 					err := c.notify.Notify(resp.Method, resp.Params)
 					if err != nil {
 						c.setErr(err)
-						c.ws.Close()
+						c.ws.Close(websocket.StatusInternalError, err.Error())
 					}
 					close(unblockNext)
 				}(block, unblockNext)
@@ -332,8 +334,7 @@ func (c *Client) Call(ctx context.Context, method string, result interface{}, ar
 		ID:      id,
 	}
 	c.writing.Lock()
-	c.ws.SetWriteDeadline(time.Now().Add(writeWait))
-	err = c.ws.WriteJSON(request)
+	err = wsjson.Write(ctx, c.ws, request)
 	c.writing.Unlock()
 	if err != nil {
 		return err

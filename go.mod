@@ -2,4 +2,4 @@ module github.com/jrick/wsrpc/v2
 
 go 1.11
 
-require github.com/gorilla/websocket v1.4.0
+require nhooyr.io/websocket v1.6.3
